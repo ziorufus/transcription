@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+openai
+openai-whisper
+pycountry
+python-multipart
+numpy
+torch
+tqdm
+transformers
+PyYAML
