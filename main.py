@@ -8,12 +8,15 @@ import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, List, Any, Sequence
+from typing import Dict, Optional, List
 from uuid import uuid4
 import secrets
 import re
 import sys
 import logging
+import time
+import urllib
+import yaml
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -29,6 +32,10 @@ from whisper_progress import transcribe as transcribe_with_progress  # your edit
 
 import pycountry
 from openai import OpenAI
+
+from http_utils import build_url, encode_multipart_formdata, request_json, download_file
+from srt_functions import json_to_srt, srt_to_json
+from extract_portions import extract_wave_portions
 
 # Load .env if present (does nothing if missing)
 load_dotenv()
@@ -55,13 +62,17 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 ENABLE_AUDIO = _env_flag("ENABLE_AUDIO", default=True)
 ENABLE_CONVERSION = _env_flag("ENABLE_CONVERSION", default=True)
 
-_TS_RE = re.compile(
-    r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})$"
-)
-_TIMING_RE = re.compile(
-    r"^(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})"
-    r"(?:\s+(?P<settings>.*))?$"
-)
+SEGMENT_URL = os.getenv("SEGMENT_URL", "")
+SEGMENT_TOKEN = os.getenv("SEGMENT_TOKEN", "")
+SEGMENT_POLL_INTERVAL = float(os.getenv("SEGMENT_POLL_INTERVAL", "3"))
+SEGMENT_TIMEOUT = float(os.getenv("SEGMENT_TIMEOUT", "300"))
+SEGMENT_DELTA = float(os.getenv("SEGMENT_DELTA", "0.1"))
+
+SEGMENT_LANGS = os.getenv("SEGMENT_LANGS", "")  # comma-separated list of language codes, e.g. "en,es,fr"
+if SEGMENT_LANGS:
+    SEGMENT_LANGS = [lang.strip() for lang in SEGMENT_LANGS.split(",") if lang.strip()]
+else:
+    SEGMENT_LANGS = None
 
 # --- Bearer auth ---
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -154,7 +165,7 @@ _model_lock = threading.Lock()
 _model = None
 
 
-def _set_job_progress(job_id: str, pct: float, lang: str = None, stage: str = "transcribing") -> None:
+def _set_job_progress(job_id: str, pct: float, lang: str = None, stage: str = "transcribing", start: float = 0.0, end: float = 1.0) -> None:
     """
     Safely update job progress (0..100) and optionally the stage.
 
@@ -163,7 +174,7 @@ def _set_job_progress(job_id: str, pct: float, lang: str = None, stage: str = "t
     """
     # clamp + sanitize
     try:
-        pct_f = float(pct)
+        pct_f = float(start * 100 + pct * 100 * (end - start))
     except (TypeError, ValueError):
         return
 
@@ -236,161 +247,6 @@ def lang_code_to_name(code: str) -> str:
     return language.name
 
 
-def _ts_to_ms(ts: str) -> int:
-    m = _TS_RE.match(ts.strip())
-    if not m:
-        raise ValueError(f"Invalid SRT timestamp: {ts!r}")
-    h = int(m.group("h"))
-    mi = int(m.group("m"))
-    s = int(m.group("s"))
-    ms = int(m.group("ms"))
-    return (((h * 60 + mi) * 60) + s) * 1000 + ms
-
-
-def _ms_to_ts(total_ms: int) -> str:
-    if total_ms < 0:
-        raise ValueError("Timestamp cannot be negative")
-    ms = total_ms % 1000
-    total_s = total_ms // 1000
-    s = total_s % 60
-    total_m = total_s // 60
-    m = total_m % 60
-    h = total_m // 60
-    if h > 99:
-        raise ValueError("SRT hours exceed 99 (unsupported by this formatter)")
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def srt_to_json(srt_text: str, *, as_string: bool = False) -> List[Dict[str, Any]] | str:
-    """
-    Convert SRT text into a JSON-friendly list of dicts.
-
-    Output schema (per cue):
-      {
-        "id": int,                       # subtitle index in file
-        "start": "HH:MM:SS,mmm",
-        "end": "HH:MM:SS,mmm",
-        "start_ms": int,
-        "end_ms": int,
-        "settings": str | null,          # any trailing SRT timing settings
-        "text": str                      # cue text (may contain newlines)
-      }
-
-    If as_string=True, returns a pretty-printed JSON string; otherwise returns Python objects.
-    """
-    # Normalize newlines and strip BOM if present
-    text = srt_text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
-
-    # Split on blank lines (one or more)
-    blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
-    out: List[Dict[str, Any]] = []
-
-    for block in blocks:
-        lines = [ln.rstrip("\n") for ln in block.split("\n") if ln.strip() != "" or True]
-        if len(lines) < 2:
-            continue
-
-        # Parse id
-        idx_line = lines[0].strip()
-        if not idx_line.isdigit():
-            raise ValueError(f"Invalid SRT index line: {idx_line!r}")
-        cue_id = int(idx_line)
-
-        # Parse timing line
-        timing_line = lines[1].strip()
-        tm = _TIMING_RE.match(timing_line)
-        if not tm:
-            raise ValueError(f"Invalid SRT timing line: {timing_line!r}")
-
-        start = tm.group("start")
-        end = tm.group("end")
-        settings = tm.group("settings")
-
-        # Remaining lines are text (can be multiple lines)
-        cue_text = "\n".join(lines[2:]).rstrip()
-
-        cue = {
-            "id": cue_id,
-            "start": start,
-            "end": end,
-            "start_ms": _ts_to_ms(start),
-            "end_ms": _ts_to_ms(end),
-            "settings": settings if settings else None,
-            "text": cue_text,
-        }
-        out.append(cue)
-
-    # Preserve original ordering; also useful to sort if needed:
-    out.sort(key=lambda d: d["id"])
-
-    if as_string:
-        return json.dumps(out, ensure_ascii=False, indent=2)
-    return out
-
-
-def json_to_srt(items: Sequence[Dict[str, Any]] | str) -> str:
-    """
-    Convert JSON (list of dicts or a JSON string) back into SRT text.
-
-    Accepts items with either:
-      - "start"/"end" as SRT timestamps ("HH:MM:SS,mmm"), or
-      - "start_ms"/"end_ms" as integers (ms)
-    Optional: "settings" appended after timing arrow.
-    Required: "id" (int), "text" (str).
-    """
-    if isinstance(items, str):
-        items = json.loads(items)
-
-    # Basic validation + normalization
-    cues: List[Dict[str, Any]] = []
-    for it in items:  # type: ignore[assignment]
-        if not isinstance(it, dict):
-            raise ValueError("Each JSON item must be an object/dict")
-
-        if "id" not in it or "text" not in it:
-            raise ValueError("Each item must contain 'id' and 'text'")
-
-        cue_id = int(it["id"])
-        cue_text = "" if it["text"] is None else str(it["text"])
-
-        settings = it.get("settings")
-        settings_str = f" {settings}".rstrip() if settings else ""
-
-        if "start" in it and "end" in it:
-            start = str(it["start"]).strip()
-            end = str(it["end"]).strip()
-            # validate format
-            _ = _ts_to_ms(start)
-            _ = _ts_to_ms(end)
-        elif "start_ms" in it and "end_ms" in it:
-            start = _ms_to_ts(int(it["start_ms"]))
-            end = _ms_to_ts(int(it["end_ms"]))
-        else:
-            raise ValueError("Each item must contain either ('start','end') or ('start_ms','end_ms')")
-
-        cues.append(
-            {
-                "id": cue_id,
-                "start": start,
-                "end": end,
-                "settings_str": settings_str,
-                "text": cue_text,
-            }
-        )
-
-    cues.sort(key=lambda d: d["id"])
-
-    parts: List[str] = []
-    for c in cues:
-        parts.append(str(c["id"]))
-        parts.append(f"{c['start']} --> {c['end']}{c['settings_str']}".rstrip())
-        # Keep text lines as-is; SRT expects newline separation
-        parts.append(c["text"].rstrip("\n"))
-        parts.append("")  # blank line between cues
-
-    return "\n".join(parts).rstrip() + "\n"
-
-
 def _format_srt_timestamp(seconds: float) -> str:
     # SRT uses comma for milliseconds: HH:MM:SS,mmm
     if seconds < 0:
@@ -455,28 +311,137 @@ def _run_job(job_id: str) -> None:
             job.progress = 0.0
         model = _load_model()
 
-        with _jobs_lock:
-            job.stage = "transcribing"
-            job.progress = 0.0
+        # Check the SEGMENT_URL variable
+        perform_transcription = True
 
-        # fp16 is only meaningful on GPUs; on CPU it can be False safely.
-        # result = model.transcribe(
-        #     str(job.audio_path),
-        #     language=job.language,
-        #     fp16=False,
-        #     verbose=False,
-        # )
-        result = transcribe_with_progress(
-            model,
-            str(job.audio_path),
-            language=job.language,
-            fp16=False,
-            verbose=False,
-            progress_callback=lambda pct, lang: _set_job_progress(job_id, pct, lang=lang),
-        )
+        if job.language is not None:
+            this_segment_url = SEGMENT_URL
+            if SEGMENT_LANGS is not None and job.language in SEGMENT_LANGS:
+                this_segment_url = os.environ.get(f"SEGMENT_URL_{job.language.lower()}", SEGMENT_URL)
+                this_segment_token = os.environ.get(f"SEGMENT_TOKEN_{job.language.lower()}", SEGMENT_TOKEN)
+            
+            if this_segment_url:
+                perform_transcription = False
 
-        segments = result.get("segments") or []
-        srt_text = _segments_to_srt(segments)
+                with _jobs_lock:
+                    job.stage = "segmenting audio"
+                    job.progress = 0.0
+                
+                segment_output_path = job.out_path.with_suffix(".yaml")
+
+                body, content_type = encode_multipart_formdata({}, "wav_file", job.audio_path)
+                start_url = build_url(this_segment_url, "/segment-start")
+                status_url = build_url(this_segment_url, "/segment-status")
+                output_url = build_url(this_segment_url, "/segment-out")
+                logger.info(f"Submitting {job.audio_path} to {start_url}")
+                start_payload = request_json(
+                    start_url,
+                    method="POST",
+                    token=this_segment_token,
+                    data=body,
+                    content_type=content_type,
+                )
+                segment_job_id = start_payload["job_id"]
+                logger.info(f"Job started: {segment_job_id}")
+
+                started_at = time.monotonic()
+                last_progress = None
+
+                while True:
+                    if SEGMENT_TIMEOUT and (time.monotonic() - started_at) > SEGMENT_TIMEOUT:
+                        raise TimeoutError(
+                            f"Timed out after {SEGMENT_TIMEOUT} seconds while waiting for job {segment_job_id} to complete"
+                        )
+
+                    query = urllib.parse.urlencode({"job_id": segment_job_id})
+                    status_payload = request_json(
+                        f"{status_url}?{query}",
+                        method="GET",
+                        token=this_segment_token,
+                    )
+                    status = status_payload["status"]
+                    progress = status_payload.get("progress")
+
+                    if progress != last_progress:
+                        if progress is None:
+                            logger.info(f"Status: {status}")
+                        else:
+                            logger.info(f"Status: {status} ({progress:.1f}%)")
+                        last_progress = progress
+
+                    if status == "completed":
+                        break
+                    if status == "error":
+                        raise RuntimeError(
+                            f"Segmentation job {segment_job_id} failed: {status_payload.get('error', 'unknown error')}"
+                        )
+
+                    time.sleep(max(SEGMENT_POLL_INTERVAL, 0.1))
+
+                query = urllib.parse.urlencode({"job_id": segment_job_id})
+                download_file(f"{output_url}?{query}", this_segment_token, segment_output_path)
+                logger.info(f"Saved YAML output to {segment_output_path}")
+
+                with segment_output_path.open("r", encoding="utf-8") as f:
+                    segments = yaml.safe_load(f)
+
+                with _jobs_lock:
+                    job.stage = "saving segments"
+                    job.progress = 0.0
+
+                total_duration = extract_wave_portions(
+                    wav_file=str(job.audio_path),
+                    segments=segments,
+                    output_folder=str(job.out_path.parent / f"segments"),
+                    delta=SEGMENT_DELTA,
+                )
+                logger.info(f"Extracted audio segments to {job.out_path.parent / f'segments'}")
+
+                with _jobs_lock:
+                    job.stage = "transcribing"
+                    job.progress = 0.0
+
+                # Run transcribe_with_progress on each segment and combine results into a single .srt
+                segment_results = []
+                duration_until_now = 0.0
+                for i, segment in enumerate(segments):
+                    offset = float(segment["offset"] - SEGMENT_DELTA)
+                    segment_output = job.out_path.parent / f"segments" / f"portion_{i}.wav"
+                    if segment_output.is_file():
+                        result = transcribe_with_progress(
+                            model,
+                            str(segment_output),
+                            language=job.language,
+                            fp16=False,
+                            verbose=False,
+                            progress_callback=lambda pct, lang: _set_job_progress(job_id, pct, lang=lang,
+                                start=duration_until_now / total_duration,
+                                end=(duration_until_now + segment["duration"]) / total_duration,
+                                stage=f"transcribing segment {i+1}/{len(segments)}"),
+                                # stage=f"transcribing"),
+                        )
+                        for seg in result.get("segments") or []:
+                            seg["start"] += offset
+                            seg["end"] += offset
+                        segment_results.extend(result.get("segments") or [])
+                        duration_until_now += segment["duration"]
+                    else:
+                        raise FileNotFoundError(f"Segment output not found: {segment_output}")
+
+        if perform_transcription:
+            logger.info("Starting complete transcription with Whisper model")
+            result = transcribe_with_progress(
+                model,
+                str(job.audio_path),
+                language=job.language,
+                fp16=False,
+                verbose=False,
+                progress_callback=lambda pct, lang: _set_job_progress(job_id, pct, lang=lang),
+            )
+
+            segment_results = result.get("segments") or []
+        
+        srt_text = _segments_to_srt(segment_results)
 
         job.out_path.write_text(srt_text, encoding="utf-8")
         job.language = result.get("language")
@@ -556,6 +521,7 @@ I expect to receive a list of {len(batch)} {output_lang_str} sentence{plural}.
 
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
+        logger.warning("Conversion job %s failed:\n%s", job_id, err)
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job is not None:
@@ -601,6 +567,7 @@ def _run_audio_extraction_job(job_id: str) -> None:
 
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
+        logger.warning("Audio extraction job %s failed:\n%s", job_id, err)
         with _audio_jobs_lock:
             job = _audio_jobs.get(job_id)
             if job is not None:
@@ -617,9 +584,50 @@ def _run_audio_extraction_job(job_id: str) -> None:
                 pass
 
 
+def _get_persisted_audio_job(job_id: str) -> Optional[AudioExtractionJobInfo]:
+    job_dir = JOBS_DIR / f"audio_{job_id}"
+    audio_path = job_dir / "output.wav"
+    if not audio_path.exists():
+        return None
+
+    return AudioExtractionJobInfo(
+        status="completed",
+        video_path=job_dir / "input",
+        audio_path=audio_path,
+        error=None,
+        stage="completed",
+        progress=100.0,
+    )
+
+
+def _get_persisted_conversion_job(job_id: str) -> Optional[JobInfo]:
+    job_dir = JOBS_DIR / job_id
+    out_path = job_dir / "output.srt"
+    out_translated_path = job_dir / "output_translated.srt"
+    if not out_path.exists() and not out_translated_path.exists():
+        return None
+
+    return JobInfo(
+        status="completed",
+        video_path=job_dir / "input",
+        audio_path=job_dir / "audio.wav",
+        out_path=out_path,
+        out_translated_path=out_translated_path,
+        language=None,
+        translate_to="persisted" if out_translated_path.exists() else None,
+        error=None,
+        stage="completed",
+        progress=100.0,
+    )
+
+
 def _get_audio_job_or_404(job_id: str) -> AudioExtractionJobInfo:
     with _audio_jobs_lock:
         job = _audio_jobs.get(job_id)
+    if job is not None:
+        return job
+
+    job = _get_persisted_audio_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown id")
     return job
@@ -628,6 +636,10 @@ def _get_audio_job_or_404(job_id: str) -> AudioExtractionJobInfo:
 def _get_conversion_job_or_404(job_id: str) -> JobInfo:
     with _jobs_lock:
         job = _jobs.get(job_id)
+    if job is not None:
+        return job
+
+    job = _get_persisted_conversion_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown id")
     return job
