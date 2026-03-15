@@ -17,6 +17,7 @@ import logging
 import time
 import urllib
 import yaml
+import requests
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -34,7 +35,7 @@ import pycountry
 from openai import OpenAI
 
 from http_utils import build_url, encode_multipart_formdata, request_json, download_file
-from srt_functions import json_to_srt, srt_to_json
+from srt_functions import json_to_srt, split_for_translation, srt_to_json
 from extract_portions import extract_wave_portions
 
 # Load .env if present (does nothing if missing)
@@ -54,7 +55,7 @@ JOBS_DIR = Path(os.getenv("JOBS_DIR", "./jobs")).resolve()
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MODEL_NAME = os.getenv("WHISPER_MODEL", "large")
-BATCH_SIZE = os.getenv("BATCH_SIZE", DEFAULT_BATCH_SIZE)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", DEFAULT_BATCH_SIZE))
 API_URL = os.getenv("API_URL")
 WEBUI_API_KEY = os.environ.get("WEBUI_API_KEY")
 
@@ -74,6 +75,11 @@ if SEGMENT_LANGS:
 else:
     SEGMENT_LANGS = None
 
+TRANSLATE_URL = os.getenv("TRANSLATE_URL", "")
+TRANSLATE_TOKEN = os.getenv("TRANSLATE_TOKEN", "")
+ALIGNER_URL = os.getenv("ALIGNER_URL", "")
+ALIGNER_TOKEN = os.getenv("ALIGNER_TOKEN", "")
+
 # --- Bearer auth ---
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -82,6 +88,56 @@ if not API_BEARER_TOKEN:
     # Random token at startup if not set (print it so you can copy it)
     API_BEARER_TOKEN = secrets.token_urlsafe(32)
     logger.info(f"[{APP_NAME}] Generated API_BEARER_TOKEN:\n{API_BEARER_TOKEN}\n")
+
+
+def align_srt(
+    base_url: str,
+    bearer_token: str,
+    srt_path: str,
+    translation_text: str,
+    output_path: str | None = None,
+) -> str:
+    url = f"{base_url.rstrip('/')}/align"
+
+    with open(srt_path, "rb") as srt_file:
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            files={"srt_file": (Path(srt_path).name, srt_file, "application/x-subrip")},
+            data={"translation_text": translation_text},
+            timeout=300,
+        )
+
+    response.raise_for_status()
+
+    aligned_srt = response.text
+
+    if output_path:
+        Path(output_path).write_text(aligned_srt, encoding="utf-8")
+
+    return aligned_srt
+
+
+def translate_text(text: str, target_lang: str, api_url: str, bearer_token: str) -> str:
+    url = f"{api_url.rstrip('/')}/translate"
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {bearer_token}",
+        },
+        json={
+            "text": text,
+            "target_lang": target_lang,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["translation"]
+
+# # Example
+# translated = translate_text("Ciao, come stai?", "en")
+# print(translated)
 
 # def require_bearer_token(
 #     creds: HTTPAuthorizationCredentials = Depends(bearer_scheme),
@@ -446,21 +502,39 @@ def _run_job(job_id: str) -> None:
         job.out_path.write_text(srt_text, encoding="utf-8")
         job.language = result.get("language")
 
-        if job.translate_to:
-            if job.translate_to != job.language:
-                with _jobs_lock:
-                    job.stage = "translating"
-                    job.progress = 0.0
+        if job.translate_to and job.translate_to != job.language:
+            with _jobs_lock:
+                job.stage = "translating"
+                job.progress = 0.0
 
-                o = srt_to_json(job.out_path.read_text(encoding="utf-8"))
-                input_lang_str = lang_code_to_name(job.language)
-                output_lang_str = lang_code_to_name(job.translate_to)
+            o = srt_to_json(job.out_path.read_text(encoding="utf-8"))
+            input_lang_str = lang_code_to_name(job.language)
+            output_lang_str = lang_code_to_name(job.translate_to)
 
-                sentences = []
+            chunks = split_for_translation(o, BATCH_SIZE)
 
-                total = len(o)
-                for start in range(0, total, BATCH_SIZE):
-                    batch = o[start : start + BATCH_SIZE]
+            sentences = []
+
+            total = len(o)
+            start = 0
+
+            if TRANSLATE_URL and ALIGNER_URL:
+                out_text = ""
+                for batch in chunks:
+                    this_text = "\n".join(el["text"] for el in batch)
+                    translation = translate_text(this_text, job.translate_to, TRANSLATE_URL, TRANSLATE_TOKEN)
+                    out_text += translation + "\n"
+                
+                aligned_srt = align_srt(
+                    ALIGNER_URL,
+                    ALIGNER_TOKEN,
+                    str(job.out_path),
+                    out_text,
+                    job.out_translated_path
+                )
+
+            else:
+                for batch in chunks:
 
                     list_of_strings = "\n".join(
                         f"[{el['id']}] {el['text']}" for el in batch
@@ -471,13 +545,13 @@ def _run_job(job_id: str) -> None:
                         plural = ""
 
                     prompt = f"""You are a professional {input_lang_str} ({job.language}) to {output_lang_str} ({job.translate_to}) translator.
-Your goal is to accurately convey the meaning and nuances of the original {input_lang_str} text while adhering to {output_lang_str} grammar, vocabulary, and cultural sensitivities.
-Produce only the {output_lang_str} translation, without any additional explanations or commentary. Please translate the follwing {input_lang_str} texts (representing subtitles) into {output_lang_str}.
-Return the same exact {len(batch)} ID{plural} with translated text; do not merge or split entries.
-I expect to receive a list of {len(batch)} {output_lang_str} sentence{plural}.
+    Your goal is to accurately convey the meaning and nuances of the original {input_lang_str} text while adhering to {output_lang_str} grammar, vocabulary, and cultural sensitivities.
+    Produce only the {output_lang_str} translation, without any additional explanations or commentary. Please translate the follwing {input_lang_str} texts (representing subtitles) into {output_lang_str}.
+    Return the same exact {len(batch)} ID{plural} with translated text; do not merge or split entries.
+    I expect to receive a list of {len(batch)} {output_lang_str} sentence{plural}.
 
-{list_of_strings}
-"""
+    {list_of_strings}
+    """
 
                     resp = client.chat.completions.create(
                         model=MODEL_NAME,
@@ -493,7 +567,8 @@ I expect to receive a list of {len(batch)} {output_lang_str} sentence{plural}.
                     out_sentences = re.findall(r"\[\d+\]\s*(.+)", out)
                     sentences.extend(out_sentences)
 
-                    progress = (min(start + BATCH_SIZE, total) / total) * 100
+                    start += len(batch)
+                    progress = (min(start, total) / total) * 100
                     job.progress = progress
 
                 # if len(sentences) != len(o):

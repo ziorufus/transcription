@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _TS_RE = re.compile(
     r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})$"
@@ -129,3 +129,70 @@ def json_to_srt(items: Sequence[Dict[str, Any]] | str) -> str:
         parts.append("")
 
     return "\n".join(parts).rstrip() + "\n"
+
+def split_for_translation(
+    chunks: List[Dict[str, Any]],
+    min_group_size: int = 10,
+    lookahead: int = 5,
+    gap_threshold_ms: int = 2000,
+    end_punct: Tuple[str, ...] = (".", "?", "!"),
+) -> List[List[Dict[str, Any]]]:
+    """
+    Split subtitle chunks into groups using the user-specified policy:
+
+    - Each group has at least `min_group_size` chunks, unless we run out at the end.
+    - Once `min_group_size` is reached, inspect the following `lookahead` chunks:
+        1) If a gap between consecutive cues is > gap_threshold_ms, break *before* the chunk after the gap.
+        2) Else, if any of those lookahead chunks ends with '.', '?', or '!', break *at* that chunk.
+        3) Else, break after those lookahead chunks (i.e., group size = min_group_size + lookahead),
+           or earlier if the file ends.
+
+    Returns: list of groups, each group is a list of SRTChunk.
+    """
+    n = len(chunks)
+    if n == 0:
+        return []
+
+    groups: List[List[Dict[str, Any]]] = []
+    i = 0
+
+    while i < n:
+        # If not enough remaining to reach min_group_size, just take the rest.
+        if i + min_group_size >= n:
+            groups.append(chunks[i:])
+            break
+
+        base_end = i + min_group_size - 1  # inclusive index of the 10th chunk in the group
+        look_start = base_end + 1
+        look_end = min(n - 1, base_end + lookahead)  # inclusive
+
+        break_at: Optional[int] = None  # inclusive index where group ends
+
+        # 1) Gap rule: find first gap > threshold among boundary pairs inside the lookahead window
+        # We need to check gaps between consecutive cues; the earliest relevant pair could be
+        # (look_start-1, look_start), then (look_start, look_start+1), ... up to look_end.
+        for k in range(look_start, look_end + 1):
+            prev = chunks[k - 1]
+            curr = chunks[k]
+            gap = curr["start_ms"] - prev["end_ms"]
+            if gap > gap_threshold_ms:
+                # break before curr => group ends at k-1
+                break_at = k - 1
+                break
+
+        # 2) Punctuation rule: within the same lookahead chunks
+        if break_at is None:
+            for k in range(look_start, look_end + 1):
+                if chunks[k]["text"].rstrip().endswith(end_punct):
+                    break_at = k
+                    break
+
+        # 3) Fallback: split after lookahead (i.e., after total min_group_size + lookahead),
+        # or at end if fewer remain.
+        if break_at is None:
+            break_at = look_end
+
+        groups.append(chunks[i : break_at + 1])
+        i = break_at + 1
+
+    return groups
