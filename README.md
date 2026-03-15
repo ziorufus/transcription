@@ -3,14 +3,17 @@
 Small FastAPI service for:
 - extracting WAV audio from uploaded media files
 - transcribing media to `.srt` with OpenAI Whisper
-- optionally translating subtitles through an OpenAI-compatible chat/completions API
+- optionally translating subtitles through either:
+- an aligner+translator service pair
+- an OpenAI-compatible chat/completions API
 
 ## Requirements
 
 - Python 3.10+
 - `ffmpeg` available on `PATH`
 - a machine that can run Whisper locally
-- optional: an OpenAI-compatible API for subtitle translation
+- optional: a translation service and aligner service for translated subtitle output
+- optional: an OpenAI-compatible API for subtitle translation fallback
 
 ## Install
 
@@ -32,6 +35,10 @@ Main variables:
 - `JOBS_DIR`: directory used to store uploaded files and outputs
 - `WHISPER_MODEL`: Whisper model name, default `large`
 - `BATCH_SIZE`: subtitle batch size for translation requests
+- `TRANSLATE_URL`: full translation endpoint URL used by the aligner+translator flow
+- `TRANSLATE_TOKEN`: bearer token for the translation service
+- `ALIGNER_URL`: base URL for the subtitle aligner service
+- `ALIGNER_TOKEN`: bearer token for the aligner service
 - `API_URL`: base URL for the translation backend
 - `WEBUI_API_KEY`: API key for the translation backend
 - `MODEL_NAME`: model used for subtitle translation
@@ -51,6 +58,11 @@ Segmentation variables:
 
 If `API_BEARER_TOKEN` is not set, the app generates one at startup.
 
+Translation behavior:
+- if both `TRANSLATE_URL` and `ALIGNER_URL` are set, the app translates subtitle batches with the translation service and then aligns the translated text back to SRT timing with the aligner service
+- `TRANSLATE_URL` should be the full translation endpoint URL and should not include a trailing slash for services like `https://api.matita.net/madlad/translate`
+- if either `TRANSLATE_URL` or `ALIGNER_URL` is missing, the app falls back to the OpenAI-compatible chat/completions configuration through `API_URL`, `WEBUI_API_KEY`, and `MODEL_NAME`
+
 Segmentation behavior:
 - if `SEGMENT_URL` is empty, the app transcribes the full extracted WAV directly with Whisper
 - if `source` is provided and `SEGMENT_URL` is set, the app sends the WAV to the segmentation service, downloads the YAML result, extracts audio portions, and transcribes each portion
@@ -65,10 +77,15 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 Open the docs at `http://localhost:8000/docs`.
 
-Example `.env` snippet with segmentation enabled:
+Example `.env` snippet with segmentation and aligner+translator flow enabled:
 
 ```dotenv
 API_BEARER_TOKEN=replace-with-a-secure-token
+
+TRANSLATE_URL=https://api.matita.net/madlad/translate
+TRANSLATE_TOKEN=replace-with-translation-token
+ALIGNER_URL=https://api.matita.net/aligner
+ALIGNER_TOKEN=replace-with-aligner-token
 
 SEGMENT_URL=http://127.0.0.1:8001
 SEGMENT_TOKEN=replace-with-segmentation-token
@@ -82,6 +99,16 @@ SEGMENT_URL_EN=http://127.0.0.1:8001
 SEGMENT_TOKEN_EN=replace-with-en-token
 SEGMENT_URL_IT=http://127.0.0.1:8002
 SEGMENT_TOKEN_IT=replace-with-it-token
+```
+
+Example `.env` snippet with OpenAI-compatible translation fallback:
+
+```dotenv
+API_BEARER_TOKEN=replace-with-a-secure-token
+
+API_URL=https://api.openai.com/v1
+WEBUI_API_KEY=replace-with-api-key
+MODEL_NAME=gpt-4o-mini
 ```
 
 ## Authentication
