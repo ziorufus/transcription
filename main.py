@@ -40,6 +40,7 @@ from extract_portions import extract_wave_portions
 
 # Load .env if present (does nothing if missing)
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -208,8 +209,6 @@ client = OpenAI(
     api_key=WEBUI_API_KEY,
     base_url=API_URL,
 )
-
-logger = logging.getLogger("uvicorn.error")
 
 _jobs: Dict[str, JobInfo] = {}
 _jobs_lock = threading.Lock()
